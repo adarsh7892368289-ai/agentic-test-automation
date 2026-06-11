@@ -39,11 +39,12 @@ class PageScanner {
   // Attaches listener for enrichment batch completion events
   // Logs debug info when batch enrichment finishes for troubleshooting
   setupErrorListener() {
-    window.addEventListener('enrichment-batch-complete', (event) => {
+    this.boundBatchCompleteHandler = (event) => {
       if (DEBUG) {
         console.log('[PageScanner] Batch enrichment complete:', event.detail);
       }
-    });
+    };
+    window.addEventListener('enrichment-batch-complete', this.boundBatchCompleteHandler);
   }
 
   // Marks scanner as active for subsequent page scans
@@ -503,7 +504,7 @@ class PageScanner {
   async collectElementsWithScrolling() {
     const allElements = new Map();
     const viewportHeight = window.innerHeight;
-    const documentHeight = document.documentElement.scrollHeight;
+    let documentHeight = document.documentElement.scrollHeight;
     let currentScroll = 0;
     let scrollSteps = 0;
 
@@ -521,28 +522,27 @@ class PageScanner {
       scrollSteps++;
 
       const elementsInView = this.collectShadowAwareElements();
-      
+
       for (const element of elementsInView) {
         const key = this.generateElementKey(element);
         if (!allElements.has(key)) {
           allElements.set(key, element);
         }
       }
-      
+
       currentScroll += viewportHeight;
-      
-      if (currentScroll >= documentHeight) {
-        window.scrollTo(0, documentHeight);
-        await this.sleepAsync(300);
-        const elementsInView = this.collectShadowAwareElements();
-        for (const element of elementsInView) {
-          const key = this.generateElementKey(element);
-          if (!allElements.has(key)) {
-            allElements.set(key, element);
-          }
-        }
-      }
-      
+
+      // Re-read the height: lazy-loading / infinite-scroll pages grow as we
+      // scroll, so a height captured once would stop us early and miss content.
+      // MAX_SCROLL_STEPS below is the backstop against truly unbounded pages.
+      documentHeight = document.documentElement.scrollHeight;
+
+      // Note: the final loop iteration already scrolls to (and collects at) the
+      // bottom-most reachable position, since the browser clamps scrollTo to
+      // max-scroll. A separate scrollTo(documentHeight) + re-collect here would
+      // re-query the identical clamped viewport — removed to avoid a redundant
+      // full-document Shadow DOM traversal + 300ms wait per scan.
+
       if (scrollSteps > MAX_SCROLL_STEPS) {
         errorTracker.logError(
           ERROR_CODES.ENRICHMENT_TIMEOUT,
@@ -902,7 +902,11 @@ class PageScanner {
   destroy() {
     this.isActive = false;
     this.clearSessionCache();
-    
+    if (this.boundBatchCompleteHandler) {
+      window.removeEventListener('enrichment-batch-complete', this.boundBatchCompleteHandler);
+      this.boundBatchCompleteHandler = null;
+    }
+
     if (DEBUG) console.log('[PageScanner] Destroyed');
   }
 

@@ -42,6 +42,10 @@ function getTrackerBundleSource() {
 
 const _browsers = new Map();
 
+// Upper bound for one in-page scanPage() evaluate. page.evaluate has no native
+// timeout, so a pathological DOM could otherwise hang runScan indefinitely.
+const SCAN_EVAL_TIMEOUT_MS = 45_000;
+
 async function _assertDescriptorAllowed(browserType, channel, executablePath) {
   if (channel == null && executablePath == null) {
     return;
@@ -131,6 +135,13 @@ async function getBrowser(descriptorOrType = 'chromium') {
     }
     throw err;
   }
+  // Evict the cache entry when the browser disconnects/crashes so we don't hand
+  // out a dead handle or try to .close() it during shutdown.
+  browser.on('disconnected', () => {
+    if (_browsers.get(cacheKey) === browser) {
+      _browsers.delete(cacheKey);
+    }
+  });
   _browsers.set(cacheKey, browser);
   return browser;
 }
@@ -149,6 +160,21 @@ async function shutdownPlaywright() {
 
 function _cancelErr() {
   return Object.assign(new Error('cancelled'), { code: 'CANCELLED', name: 'CancelledError' });
+}
+
+// Reject `promise` if it doesn't settle within `ms`. The in-page evaluate keeps
+// running, but the caller's finally{} closes the page/context to free it.
+function _withTimeout(promise, ms, label) {
+  let timer = null;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${Math.round(ms / 1000)}s`)), ms);
+    timer.unref?.();
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  });
 }
 
 // ---- automated Element Scan -------------------------------------------------
@@ -208,10 +234,18 @@ async function runScan({
     };
     const normalizedFilters = Array.isArray(filters) ? filters : filters ? [filters] : null;
 
-    const result = await page.evaluate(
-      ({ f, opts }) => window.__elementTracker.scanPage(f, opts),
-      { f: normalizedFilters, opts: scanOptions }
+    const result = await _withTimeout(
+      page.evaluate(
+        ({ f, opts }) => window.__elementTracker.scanPage(f, opts),
+        { f: normalizedFilters, opts: scanOptions }
+      ),
+      SCAN_EVAL_TIMEOUT_MS,
+      'page scan'
     );
+
+    if (isCancelled?.()) {
+      throw _cancelErr();
+    }
 
     onProgress?.('Scan complete', 100);
 

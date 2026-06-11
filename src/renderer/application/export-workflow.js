@@ -1,41 +1,44 @@
 'use strict';
 
-import { getElementsForMode } from './data-manager.js';
+import { getReportElements } from './report-manager.js';
 import { TRACKING_MODES } from '../state.js';
 import { Toast } from '../components/toast.js';
+import { hostFromUrl } from '../utils/report-metadata.js';
+import { sanitizeFilename } from '../utils/sanitize.js';
+import { toPlaywrightScript, buildAutomationPayload } from '@core/automation/action-projection.js';
 
 const api = window.elementTrackerAPI;
 
-const MODE_FILENAME = {
-  [TRACKING_MODES.INTERACTIONS]: 'interactions',
-  [TRACKING_MODES.FULL_PAGE]: 'elements',
-  [TRACKING_MODES.HYBRID]: 'hybrid',
-};
-
-// CSV event types that carry click/input event data (interactions schema).
 const INTERACTION_CSV_TYPES = ['input', 'click'];
 
-// Export a mode's captured elements as JSON or CSV via the save-dialog IPC.
-export async function exportMode(mode, format) {
+// Export one report's captured elements as JSON or CSV via the save-dialog IPC.
+export async function exportReport(report, format) {
+  if (!report) {
+    return;
+  }
   let elements;
   try {
-    elements = await getElementsForMode(mode);
+    elements = await getReportElements(report.id);
   } catch (err) {
     Toast.error('Export failed', err?.message);
     return;
   }
-
   if (!Array.isArray(elements) || elements.length === 0) {
-    Toast.warning('Nothing to export', 'No captured data for this mode.');
+    Toast.warning('Nothing to export', 'This report has no captured elements.');
     return;
   }
 
-  const base = MODE_FILENAME[mode] ?? 'export';
+  const base = sanitizeFilename(
+    `${hostFromUrl(report.url) || report.mode || 'report'}-${report.mode}`
+  );
   let content;
   let filename;
 
+  let fileFormat = 'json';
+
   if (format === 'csv') {
-    const hasInteractions = mode === TRACKING_MODES.INTERACTIONS || mode === TRACKING_MODES.HYBRID;
+    const hasInteractions =
+      report.mode === TRACKING_MODES.INTERACTIONS || report.mode === TRACKING_MODES.HYBRID;
     content = hasInteractions ? interactionsToCSV(elements) : elementsToCSV(elements);
     if (!content) {
       content = elementsToCSV(elements);
@@ -45,13 +48,25 @@ export async function exportMode(mode, format) {
       return;
     }
     filename = `${base}.csv`;
+    fileFormat = 'csv';
+  } else if (format === 'playwright') {
+    // Runnable Playwright test projected from the report's ordered actions.
+    content = toPlaywrightScript(report, elements);
+    filename = `${base}.spec.js`;
+    fileFormat = 'js';
+  } else if (format === 'automation') {
+    // Structured, NLP-ready payload: locator inventory + ordered action steps.
+    content = JSON.stringify(buildAutomationPayload(report, elements), null, 2);
+    filename = `${base}.automation.json`;
+    fileFormat = 'json';
   } else {
-    content = JSON.stringify(elements, null, 2);
+    content = JSON.stringify({ report, elements }, null, 2);
     filename = `${base}.json`;
+    fileFormat = 'json';
   }
 
   try {
-    const res = await api.exportFile({ content, filename, format: format === 'csv' ? 'csv' : 'json' });
+    const res = await api.exportFile({ content, filename, format: fileFormat });
     if (res?.success) {
       Toast.success(`Exported ${elements.length} element${elements.length === 1 ? '' : 's'}`);
     } else if (res?.reason !== 'cancelled') {

@@ -139,16 +139,19 @@ export function sanitizeContext(context) {
     });
 }
 
-// Filters metadata to core automation-relevant fields
-// Whitelists essential attributes while limiting classes array
-// Prevents storage waste from verbose metadata objects
+// Filters metadata to core automation-relevant fields.
+// Whitelists essential attributes while limiting classes array. Preserves the
+// locator-critical attributes (data-* test ids, ARIA role/label) that the
+// Playwright locator projection relies on — dropping these silently regresses
+// getByTestId / getByRole / getByLabel quality.
 export function sanitizeMetadata(metadata) {
   if (!metadata) return {};
-  
+
   const essential = {};
   const essentialFields = [
     'tag', 'id', 'type', 'name', 'role',
-    'width', 'height', 'placeholder', 'title', 'alt', 'href'
+    'width', 'height', 'placeholder', 'title', 'alt', 'href',
+    'value', 'currentValue', 'checked', 'required', 'disabled'
   ];
 
   for (const field of essentialFields) {
@@ -159,6 +162,32 @@ export function sanitizeMetadata(metadata) {
 
   if (metadata.classes?.length > 0) {
     essential.classes = metadata.classes.slice(0, ENRICHMENT_CONFIG.MAX_CLASSES_PER_ELEMENT);
+  }
+
+  // data-* attributes — needed for getByTestId (data-testid/test/qa/cy/...).
+  if (metadata.dataAttributes && typeof metadata.dataAttributes === 'object') {
+    const data = {};
+    for (const [k, v] of Object.entries(metadata.dataAttributes)) {
+      if (v != null) {
+        data[k] = String(v).slice(0, 256);
+      }
+    }
+    if (Object.keys(data).length > 0) {
+      essential.dataAttributes = data;
+    }
+  }
+
+  // aria-* attributes — needed for getByRole(name) / getByLabel and role inference.
+  if (metadata.ariaAttributes && typeof metadata.ariaAttributes === 'object') {
+    const aria = {};
+    for (const [k, v] of Object.entries(metadata.ariaAttributes)) {
+      if (v != null) {
+        aria[k] = String(v).slice(0, 256);
+      }
+    }
+    if (Object.keys(aria).length > 0) {
+      essential.ariaAttributes = aria;
+    }
   }
 
   return essential;

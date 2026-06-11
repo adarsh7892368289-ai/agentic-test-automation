@@ -1,6 +1,6 @@
-appId: com.element-tracker.app
-productName: Element Tracker
-copyright: Copyright © 2026 Element Tracker
+appId: com.agentic-test-automation.app
+productName: Agentic Test Automation
+copyright: Copyright © 2026 Agentic Test Automation
 afterPack: ./scripts/afterpack-fuses.js
 directories:
   buildResources: build
@@ -39,13 +39,13 @@ nsis:
   allowToChangeInstallationDirectory: true
 linux:
   category: Development
-  maintainer: Element Tracker <noreply@localhost>
+  maintainer: Agentic Test Automation <noreply@localhost>
   synopsis: Resilient XPath/CSS selector capture desktop app.
   target:
     - AppImage
     - deb
   desktop:
     entry:
-      Name: Element Tracker
+      Name: Agentic Test Automation
       Comment: Resilient XPath/CSS selector capture desktop app.
       Categories: Development;

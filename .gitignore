@@ -67,3 +67,12 @@ yarn.lock
 TODO.md
 temp.js
 *.local.md
+
+# Test authoring scratch (kept local, not part of the committed suite)
+.tmp-*.json
+.tmp-*.js
+test/.target-briefs.md
+test/.author-workflow.js
+
+# Exported scan reports (runtime artifacts, not source)
+*-full_page.json

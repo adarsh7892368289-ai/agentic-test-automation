@@ -1,9 +1,9 @@
 'use strict';
 
 // Single-source-of-truth state container (reduce/dispatch/subscribe), modeled on
-// the reference app's state.js. Holds UI phase, the active mode, capture settings,
-// per-mode stats + counts, the captures list for the sidebar, browser detection,
-// and live record-session status.
+// the reference app's state.js. Organized around REPORTS: a list of stored
+// captures shown in the left pane, a selected report shown in the main pane, and
+// three capture sections (Interactions, Element Scan, Hybrid).
 
 export const TRACKING_MODES = {
   INTERACTIONS: 'interactions',
@@ -11,8 +11,13 @@ export const TRACKING_MODES = {
   HYBRID: 'hybrid',
 };
 
+export const SECTIONS = {
+  INTERACTIONS: 'interactions',
+  SCAN: 'scan',
+  HYBRID: 'hybrid',
+};
+
 export const DEFAULT_SETTINGS = {
-  trackingMode: TRACKING_MODES.INTERACTIONS,
   captureClicks: true,
   captureInputs: true,
   captureForms: true,
@@ -22,28 +27,34 @@ export const DEFAULT_SETTINGS = {
 };
 
 const initialState = {
-  // Which main-pane section is visible.
-  section: 'record',
-  // Recording phase: 'idle' | 'recording'.
+  // Active capture section / tab.
+  section: SECTIONS.INTERACTIONS,
+
+  // Left-pane tab: 'reports' | 'ai'.
+  leftTab: 'reports',
+
+  // Stored reports (metadata only) + which one is open in the main pane.
+  reports: [],
+  selectedReportId: null,
+  selectedReportElements: null,
+
+  // Stored AI tests (full records) + which one is open in the main pane.
+  aiTests: [],
+  selectedAiTestId: null,
+
+  settings: { ...DEFAULT_SETTINGS },
+
+  // Record session: 'idle' | 'starting' | 'recording', plus which section started it.
   recordPhase: 'idle',
   recordSessionId: null,
-  recordUrl: '',
-  // Scan phase: 'idle' | 'scanning' | 'done' | 'error'.
+  recordSection: null,
+  liveCounts: { click: 0, input: 0, form: 0, navigation: 0, scroll: 0, scan: 0, elements: 0 },
+
+  // Scan: 'idle' | 'scanning' | 'error'.
   scanPhase: 'idle',
   scanProgress: { label: '', pct: 0 },
   scanError: null,
   operationId: null,
-
-  mode: TRACKING_MODES.INTERACTIONS,
-  settings: { ...DEFAULT_SETTINGS },
-
-  // Per-mode element counts (for the captures list) and stat breakdowns.
-  counts: {
-    [TRACKING_MODES.INTERACTIONS]: 0,
-    [TRACKING_MODES.FULL_PAGE]: 0,
-    [TRACKING_MODES.HYBRID]: 0,
-  },
-  stats: {},
 
   // Browser detection.
   selectedBrowser: null,
@@ -51,11 +62,7 @@ const initialState = {
   browserDetectionState: 'idle',
   browserDetectionError: null,
 
-  // Storage usage.
   usage: { usage: 0, quota: 0 },
-
-  // Live interaction counters during a record session (transient).
-  liveCounts: { click: 0, input: 0, form: 0, navigation: 0, scroll: 0, scan: 0, elements: 0 },
 };
 
 let _state = { ...initialState };
@@ -86,50 +93,97 @@ function reduce(state, type, payload) {
     case 'SECTION_CHANGED':
       return { ...state, section: payload.section };
 
-    case 'MODE_CHANGED':
-      return {
-        ...state,
-        mode: payload.mode,
-        settings: { ...state.settings, trackingMode: payload.mode },
-      };
-
     case 'SETTINGS_LOADED':
-      return {
-        ...state,
-        settings: { ...DEFAULT_SETTINGS, ...(payload.settings || {}) },
-        mode: payload.settings?.trackingMode ?? state.mode,
-      };
+      return { ...state, settings: { ...DEFAULT_SETTINGS, ...(payload.settings || {}) } };
 
     case 'SETTING_TOGGLED':
-      return {
-        ...state,
-        settings: { ...state.settings, [payload.key]: payload.value },
-      };
-
-    case 'COUNTS_LOADED':
-      return { ...state, counts: { ...state.counts, ...payload.counts } };
-
-    case 'STATS_LOADED':
-      return { ...state, stats: payload.stats ?? {} };
+      return { ...state, settings: { ...state.settings, [payload.key]: payload.value } };
 
     case 'USAGE_LOADED':
       return { ...state, usage: payload.usage ?? state.usage };
+
+    // ---- reports ----
+    case 'REPORTS_LOADED':
+      return { ...state, reports: payload.reports ?? [] };
+
+    case 'REPORT_ADDED':
+      return {
+        ...state,
+        reports: [payload.report, ...state.reports.filter((r) => r.id !== payload.report.id)],
+      };
+
+    case 'REPORT_DELETED': {
+      const reports = state.reports.filter((r) => r.id !== payload.reportId);
+      const wasSelected = state.selectedReportId === payload.reportId;
+      return {
+        ...state,
+        reports,
+        selectedReportId: wasSelected ? null : state.selectedReportId,
+        selectedReportElements: wasSelected ? null : state.selectedReportElements,
+      };
+    }
+
+    case 'REPORTS_CLEARED':
+      return { ...state, reports: [], selectedReportId: null, selectedReportElements: null };
+
+    case 'REPORT_SELECTED':
+      // Opening a report closes any open AI test (one detail pane at a time).
+      return {
+        ...state,
+        selectedReportId: payload.reportId,
+        selectedReportElements: null,
+        selectedAiTestId: null,
+      };
+
+    case 'REPORT_ELEMENTS_LOADED':
+      if (payload.reportId !== state.selectedReportId) {
+        return state;
+      }
+      return { ...state, selectedReportElements: payload.elements ?? [] };
+
+    case 'REPORT_CLOSED':
+      return { ...state, selectedReportId: null, selectedReportElements: null };
+
+    // ---- left-pane tab ----
+    case 'LEFT_TAB_CHANGED':
+      return { ...state, leftTab: payload.tab };
+
+    // ---- AI tests ----
+    case 'AI_TESTS_LOADED':
+      return { ...state, aiTests: payload.aiTests ?? [] };
+
+    case 'AI_TEST_DELETED': {
+      const aiTests = state.aiTests.filter((t) => t.id !== payload.id);
+      const wasSel = state.selectedAiTestId === payload.id;
+      return { ...state, aiTests, selectedAiTestId: wasSel ? null : state.selectedAiTestId };
+    }
+
+    case 'AI_TESTS_CLEARED':
+      return { ...state, aiTests: [], selectedAiTestId: null };
+
+    case 'AI_TEST_SELECTED':
+      // Opening an AI test closes any open report.
+      return {
+        ...state,
+        selectedAiTestId: payload.id,
+        selectedReportId: null,
+        selectedReportElements: null,
+      };
+
+    case 'AI_TEST_CLOSED':
+      return { ...state, selectedAiTestId: null };
 
     // ---- record session ----
     case 'RECORD_STARTING':
       return {
         ...state,
         recordPhase: 'starting',
-        recordUrl: payload.url ?? state.recordUrl,
+        recordSection: payload.section ?? state.section,
         liveCounts: { click: 0, input: 0, form: 0, navigation: 0, scroll: 0, scan: 0, elements: 0 },
       };
 
     case 'RECORD_STARTED':
-      return {
-        ...state,
-        recordPhase: 'recording',
-        recordSessionId: payload.sessionId ?? null,
-      };
+      return { ...state, recordPhase: 'recording', recordSessionId: payload.sessionId ?? null };
 
     case 'RECORD_EVENT': {
       const t = payload.captureType;
@@ -148,10 +202,8 @@ function reduce(state, type, payload) {
     }
 
     case 'RECORD_STOPPED':
-      return { ...state, recordPhase: 'idle', recordSessionId: null };
-
     case 'RECORD_FAILED':
-      return { ...state, recordPhase: 'idle', recordSessionId: null };
+      return { ...state, recordPhase: 'idle', recordSessionId: null, recordSection: null };
 
     // ---- scan ----
     case 'SCAN_STARTED':
@@ -170,20 +222,10 @@ function reduce(state, type, payload) {
       return { ...state, scanProgress: { label: payload.label, pct: payload.pct } };
 
     case 'SCAN_DONE':
-      return {
-        ...state,
-        scanPhase: 'done',
-        scanProgress: { label: 'Complete', pct: 100 },
-        operationId: null,
-      };
+      return { ...state, scanPhase: 'idle', scanProgress: { label: '', pct: 0 }, operationId: null };
 
     case 'SCAN_ERROR':
-      return {
-        ...state,
-        scanPhase: 'error',
-        scanError: payload.error ?? 'Scan failed',
-        operationId: null,
-      };
+      return { ...state, scanPhase: 'error', scanError: payload.error ?? 'Scan failed', operationId: null };
 
     case 'SCAN_RESET':
       return { ...state, scanPhase: 'idle', scanProgress: { label: '', pct: 0 }, scanError: null };

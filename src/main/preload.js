@@ -31,6 +31,12 @@ contextBridge.exposeInMainWorld('elementTrackerAPI', {
   onRecordScan: makePushBridge(CH.RECORD_SCAN),
   onRecordSessionClosed: makePushBridge(CH.RECORD_SESSION_CLOSED),
 
+  // AI Automation (headless Claude Code)
+  aiCheckCli: () => ipcRenderer.invoke(CH.AI_CHECK_CLI),
+  aiRun: (params) => ipcRenderer.invoke(CH.AI_RUN, params),
+  aiCancel: (payload) => ipcRenderer.invoke(CH.AI_CANCEL, payload),
+  onAiProgress: makePushBridge(CH.AI_PROGRESS),
+
   // Cancellation
   cancelOperation: (payload) => ipcRenderer.invoke(CH.CANCEL_OPERATION, payload),
 

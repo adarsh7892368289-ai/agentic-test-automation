@@ -69,8 +69,16 @@ function isSafeBasename(name) {
 }
 
 function stripPollutionKeys(value, depth = 0) {
-  if (depth > 64 || value == null || typeof value !== 'object') {
+  if (value == null || typeof value !== 'object') {
     return value;
+  }
+  // Anti-recursion guard. Past the depth budget we cannot recurse to strip
+  // forbidden keys, so FAIL CLOSED: drop the over-deep subtree entirely rather
+  // than passing it through un-sanitized (which would let a __proto__/constructor
+  // own-key buried >64 levels deep survive). 64 levels far exceeds any legitimate
+  // element-descriptor nesting.
+  if (depth > 64) {
+    return null;
   }
   if (Array.isArray(value)) {
     return value.map((v) => stripPollutionKeys(v, depth + 1));

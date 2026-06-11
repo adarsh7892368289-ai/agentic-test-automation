@@ -2,7 +2,7 @@
 
 import storage from '../infrastructure/idb-repository.js';
 import { dispatch, getState, TRACKING_MODES } from '../state.js';
-import { persistCapture } from './data-manager.js';
+import { createReport, selectReport } from './report-manager.js';
 import { Toast } from '../components/toast.js';
 
 const api = window.elementTrackerAPI;
@@ -11,8 +11,18 @@ function makeOperationId() {
   return `scan_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
+function browserDescriptor(state) {
+  return state.selectedBrowser
+    ? {
+        browserType: state.selectedBrowser.browserType,
+        channel: state.selectedBrowser.channel ?? null,
+        executablePath: state.selectedBrowser.executablePath ?? null,
+      }
+    : 'chromium';
+}
+
 // Run an automated Element Scan: navigate + inject + scanPage in a headless
-// Playwright browser, then persist the returned elements under FULL_PAGE mode.
+// Playwright browser, then store the result as a new report and open it.
 export async function runScan({ url, filters }) {
   const state = getState();
   if (state.scanPhase === 'scanning') {
@@ -27,17 +37,7 @@ export async function runScan({ url, filters }) {
   dispatch('SCAN_STARTED', { label: 'Starting…', pct: 0, operationId });
 
   const profiles = await storage.getAllProfiles();
-  const browser = state.selectedBrowser
-    ? {
-        browserType: state.selectedBrowser.browserType,
-        channel: state.selectedBrowser.channel ?? null,
-        executablePath: state.selectedBrowser.executablePath ?? null,
-      }
-    : 'chromium';
-
-  const normalizedFilters = (filters ?? [])
-    .map((f) => String(f).trim())
-    .filter(Boolean);
+  const normalizedFilters = (filters ?? []).map((f) => String(f).trim()).filter(Boolean);
 
   try {
     const res = await api.scanPage({
@@ -46,7 +46,7 @@ export async function runScan({ url, filters }) {
       mode: TRACKING_MODES.FULL_PAGE,
       settings: state.settings,
       profiles,
-      browser,
+      browser: browserDescriptor(state),
       operationId,
     });
 
@@ -63,19 +63,21 @@ export async function runScan({ url, filters }) {
 
     const result = res.result ?? {};
     const elements = result.scan?.elements ?? [];
-
     if (result.profiles) {
       await storage.mergeProfiles(result.profiles);
     }
 
-    const sessionId = result.scan?.scanId ?? `scan_${Date.now()}`;
-    await persistCapture(TRACKING_MODES.FULL_PAGE, sessionId, elements, {
-      scans: 1,
-      elements: elements.length,
+    const report = await createReport({
+      mode: TRACKING_MODES.FULL_PAGE,
+      url,
+      engine: result.engine ?? null,
+      elements,
+      source: 'scan',
     });
 
     dispatch('SCAN_DONE');
     Toast.success(`Scanned ${elements.length} element${elements.length === 1 ? '' : 's'}`);
+    await selectReport(report.id);
   } catch (err) {
     dispatch('SCAN_ERROR', { error: err?.message ?? String(err) });
     Toast.error('Scan failed', err?.message);

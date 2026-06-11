@@ -11,6 +11,9 @@ const { getBrowser, getTrackerBundleSource } = require('./playwright-manager');
 // Only one session is active at a time (single-window product model).
 
 let _session = null;
+// Set synchronously at the top of startRecordSession so two near-simultaneous
+// starts can't both pass the guard and each create a context (the first leaks).
+let _starting = false;
 
 // Build the page-side init script: the UMD bundle followed by a startCapture
 // call. addInitScript runs this on every navigation / new document in the
@@ -47,70 +50,90 @@ async function startRecordSession({
 }) {
   assertHttpUrl(url, 'Record URL');
 
-  if (_session) {
-    await stopRecordSession().catch(() => {});
+  if (_starting) {
+    throw Object.assign(new Error('A record session is already starting.'), { code: 'RECORD_BUSY' });
   }
+  _starting = true;
 
   const effectiveMode = mode || 'interactions';
   const effectiveSessionId = sessionId || `rec_${Date.now()}`;
   const launchTarget = browserDescriptor ?? 'chromium';
+  let context = null;
 
-  // Headed launch so the human can drive the page.
-  const browser = await getBrowser({ ..._descriptor(launchTarget), headed: true });
-  const context = await browser.newContext({ viewport: null });
-
-  const session = {
-    sessionId: effectiveSessionId,
-    mode: effectiveMode,
-    context,
-    page: null,
-    closed: false,
-    onClosed,
-  };
-  _session = session;
-
-  // Outbound transport from page → main. The page calls window.__etEmit({channel, payload}).
-  await context.exposeBinding('__etEmit', (source, message) => {
-    if (session.closed || !message || typeof message !== 'object') {
-      return;
+  // Any failure between context creation and a fully-initialized session must
+  // close the context — otherwise it leaks inside the cached headed browser.
+  try {
+    if (_session) {
+      await stopRecordSession().catch(() => {});
     }
-    const { channel, payload } = message;
-    try {
-      if (channel === 'interaction') {
-        onEvent?.(payload);
-      } else if (channel === 'scan') {
-        onScan?.(payload);
+
+    // Headed launch so the human can drive the page.
+    const browser = await getBrowser({ ..._descriptor(launchTarget), headed: true });
+
+    context = await browser.newContext({ viewport: null });
+
+    const session = {
+      sessionId: effectiveSessionId,
+      mode: effectiveMode,
+      context,
+      page: null,
+      closed: false,
+      onClosed,
+    };
+    _session = session;
+
+    // Outbound transport from page → main. The page calls window.__etEmit({channel, payload}).
+    await context.exposeBinding('__etEmit', (source, message) => {
+      if (session.closed || !message || typeof message !== 'object') {
+        return;
       }
-    } catch (err) {
-      log.warn('[RecordManager] event dispatch failed', { error: err?.message });
+      const { channel, payload } = message;
+      try {
+        if (channel === 'interaction') {
+          onEvent?.(payload);
+        } else if (channel === 'scan') {
+          onScan?.(payload);
+        }
+      } catch (err) {
+        log.warn('[RecordManager] event dispatch failed', { error: err?.message });
+      }
+    });
+
+    await context.addInitScript({
+      content: _buildInitScript(effectiveMode, settings, effectiveSessionId, profiles),
+    });
+
+    const page = await context.newPage();
+    session.page = page;
+
+    // If the user closes the browser window/tab manually, tear down + notify.
+    context.on('close', () => _handleContextClosed(session));
+    page.on('close', () => {
+      if (context.pages().length === 0) {
+        _handleContextClosed(session);
+      }
+    });
+
+    await page.goto(url, { waitUntil: 'load', timeout: 60_000 });
+    await page.bringToFront().catch(() => {});
+
+    log.info('[RecordManager] session started', {
+      sessionId: effectiveSessionId,
+      mode: effectiveMode,
+      url,
+    });
+
+    return { sessionId: effectiveSessionId, mode: effectiveMode };
+  } catch (err) {
+    log.error('[RecordManager] session start failed — cleaning up', { error: err?.message });
+    _session = null;
+    if (context) {
+      await context.close().catch(() => {});
     }
-  });
-
-  await context.addInitScript({
-    content: _buildInitScript(effectiveMode, settings, effectiveSessionId, profiles),
-  });
-
-  const page = await context.newPage();
-  session.page = page;
-
-  // If the user closes the browser window/tab manually, tear down + notify.
-  context.on('close', () => _handleContextClosed(session));
-  page.on('close', () => {
-    if (context.pages().length === 0) {
-      _handleContextClosed(session);
-    }
-  });
-
-  await page.goto(url, { waitUntil: 'load', timeout: 60_000 });
-  await page.bringToFront().catch(() => {});
-
-  log.info('[RecordManager] session started', {
-    sessionId: effectiveSessionId,
-    mode: effectiveMode,
-    url,
-  });
-
-  return { sessionId: effectiveSessionId, mode: effectiveMode };
+    throw err;
+  } finally {
+    _starting = false;
+  }
 }
 
 function _descriptor(descriptorOrType) {
@@ -164,10 +187,14 @@ async function stopRecordSession() {
   try {
     if (session.page && !session.closed) {
       profiles = await session.page
-        .evaluate(() => window.__elementTracker.exportProfiles())
-        .catch(() => ({}));
+        .evaluate(() => (window.__elementTracker ? window.__elementTracker.exportProfiles() : {}))
+        .catch((err) => {
+          log.warn('[RecordManager] exportProfiles failed', { error: err?.message });
+          return {};
+        });
     }
-  } catch {
+  } catch (err) {
+    log.warn('[RecordManager] exportProfiles threw', { error: err?.message });
     profiles = {};
   }
 

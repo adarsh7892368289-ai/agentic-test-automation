@@ -12,7 +12,16 @@ function isPathContained(rootDir, candidateAbsolutePath) {
 }
 
 function resolveContainedPath(rootDir, relativePath) {
-  const cleaned = decodeURIComponent(String(relativePath ?? '')).replace(/^\/+/, '');
+  // decodeURIComponent throws URIError on malformed percent-encoding (a lone '%',
+  // '%ZZ', a truncated '%E0', …). A containment guard must FAIL CLOSED on hostile
+  // input — return null — not crash the caller with an uncaught URIError.
+  let decoded;
+  try {
+    decoded = decodeURIComponent(String(relativePath ?? ''));
+  } catch {
+    return null;
+  }
+  const cleaned = decoded.replace(/^\/+/, '');
   const resolved = path.resolve(rootDir, cleaned);
   return isPathContained(rootDir, resolved) ? resolved : null;
 }

@@ -18,6 +18,12 @@ module.exports = Object.freeze({
   RECORD_SESSION_CLOSED: 'RECORD_SESSION_CLOSED',
   TRIGGER_RECORD_SCAN: 'TRIGGER_RECORD_SCAN',
 
+  // AI Automation (headless Claude Code)
+  AI_CHECK_CLI: 'AI_CHECK_CLI',
+  AI_RUN: 'AI_RUN',
+  AI_CANCEL: 'AI_CANCEL',
+  AI_PROGRESS: 'AI_PROGRESS',
+
   // Cancellation
   CANCEL_OPERATION: 'CANCEL_OPERATION',
 

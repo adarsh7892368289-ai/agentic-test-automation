@@ -213,7 +213,7 @@ function createMainWindow() {
       preload: path.join(__dirname, 'preload.js'),
       webSecurity: true,
     },
-    title: 'Element Tracker',
+    title: 'Agentic Test Automation',
     backgroundColor: '#111827',
     ...(process.platform === 'darwin'
       ? { titleBarStyle: 'hiddenInset', trafficLightPosition: { x: 12, y: 14 } }
@@ -305,14 +305,27 @@ app.on('activate', () => {
   }
 });
 
-app.on('before-quit', async () => {
+// Electron does NOT await an async before-quit handler — it proceeds to tear the
+// process down, which can orphan headed browser processes mid-shutdown. So on the
+// first quit we cancel the quit, run cleanup to completion, then exit. A guard
+// flag prevents the re-entrant before-quit (from app.quit()) from looping.
+let _quitting = false;
+app.on('before-quit', (event) => {
+  if (_quitting) {
+    return;
+  }
+  _quitting = true;
+  event.preventDefault();
   log.info('App quitting — stopping record session and shutting down Playwright');
-  await stopRecordSession().catch((err) =>
-    log.warn('Record session stop error during quit', { err: err.message })
-  );
-  await shutdownPlaywright().catch((err) =>
-    log.warn('Playwright shutdown error during quit', { err: err.message })
-  );
+  Promise.allSettled([
+    stopRecordSession().catch((err) => log.warn('Record session stop error during quit', { err: err.message })),
+    shutdownPlaywright().catch((err) => log.warn('Playwright shutdown error during quit', { err: err.message })),
+  ]).finally(() => {
+    // Re-issue the quit. With _quitting set, the handler above returns without
+    // preventing it, so the normal shutdown path (window close → state save →
+    // exit) runs to completion.
+    app.quit();
+  });
 });
 
 process.on('uncaughtException', (err) => {

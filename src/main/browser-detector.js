@@ -514,6 +514,7 @@ async function detectBrowsers({ refresh = false } = {}) {
 
 
   let systemBrowsers = [];
+  let systemProbeOk = true;
   try {
     if (process.platform === 'darwin') {
       systemBrowsers = _detectMacBrowsers();
@@ -523,6 +524,7 @@ async function detectBrowsers({ refresh = false } = {}) {
       systemBrowsers = _detectLinuxBrowsers();
     }
   } catch (err) {
+    systemProbeOk = false;
     log.warn('[browser-detector] system probe failed', { error: err.message });
   }
   browsers.push(...systemBrowsers);
@@ -531,7 +533,13 @@ async function detectBrowsers({ refresh = false } = {}) {
     browsers,
     detectedAt: new Date().toISOString()
   };
-  _cache = result;
+  // Only memoize a COMPLETE detection. If the system probe threw (transient
+  // reg.exe / spawn failure), the result is missing system browsers — caching it
+  // would make that partial view permanent for the app's lifetime, so let the
+  // next call retry instead. Playwright-managed browsers are always present.
+  if (systemProbeOk) {
+    _cache = result;
+  }
 
   log.info('[browser-detector] detection complete', {
     count: browsers.length,

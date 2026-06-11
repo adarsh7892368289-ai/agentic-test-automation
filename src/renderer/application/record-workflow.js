@@ -1,94 +1,72 @@
 'use strict';
 
 import storage from '../infrastructure/idb-repository.js';
-import { dispatch, getState } from '../state.js';
-import { refreshCounts, refreshUsage } from './data-manager.js';
+import { dispatch, getState, TRACKING_MODES, SECTIONS } from '../state.js';
+import { createReport, selectReport } from './report-manager.js';
 import { Toast } from '../components/toast.js';
 
 const api = window.elementTrackerAPI;
 
-// Buffer streamed elements and flush to IndexedDB periodically (mirrors the
-// extension's batched writes) to avoid a transaction per click.
-let _buffer = [];
-let _flushTimer = null;
-let _activeSessionId = null;
-let _activeMode = null;
+// Accumulate everything captured during a session; on stop, persist it as one
+// report. (The extension stored per-event; the desktop model is one report per
+// recording session, matching scans.)
+let _elements = [];
 let _statBuffer = {};
+let _session = { url: '', mode: TRACKING_MODES.INTERACTIONS, engine: null };
 
-const FLUSH_INTERVAL_MS = 1500;
-
-function scheduleFlush() {
-  if (_flushTimer) {
-    return;
-  }
-  _flushTimer = setTimeout(flushBuffer, FLUSH_INTERVAL_MS);
-}
-
-async function flushBuffer() {
-  _flushTimer = null;
-  if (_buffer.length === 0 && Object.keys(_statBuffer).length === 0) {
-    return;
-  }
-  const elements = _buffer;
-  const stats = _statBuffer;
-  _buffer = [];
-  _statBuffer = {};
-  const mode = _activeMode;
-  const sessionId = _activeSessionId ?? `rec_${Date.now()}`;
-  try {
-    if (elements.length > 0) {
-      await storage.addElements(mode, sessionId, elements);
-    }
-    if (Object.keys(stats).length > 0) {
-      const existing = (await storage.getStats(mode)).counts ?? {};
-      const merged = { ...existing };
-      for (const [k, v] of Object.entries(stats)) {
-        merged[k] = (merged[k] ?? 0) + v;
+function browserDescriptor(state) {
+  return state.selectedBrowser
+    ? {
+        browserType: state.selectedBrowser.browserType,
+        channel: state.selectedBrowser.channel ?? null,
+        executablePath: state.selectedBrowser.executablePath ?? null,
       }
-      await storage.setStats(mode, merged);
-    }
-    await refreshCounts();
-    await refreshUsage();
-  } catch (err) {
-    console.error('[record-workflow] flush failed', err);
-  }
+    : 'chromium';
 }
 
-// Push-bridge listeners are installed once at app init.
+// A session is "live" from the moment the user clicks Start: the injected
+// addInitScript arms capture on first document load, which can be BEFORE
+// startRecordSession resolves (RECORD_STARTED). Accept events while 'starting'
+// too, so the first clicks/inputs on the landing page aren't dropped.
+function _sessionLive() {
+  const phase = getState().recordPhase;
+  return phase === 'recording' || phase === 'starting';
+}
+
 export function initRecordListeners() {
   api.onRecordEvent?.((payload) => {
     const el = payload?.element;
-    if (!el) {
+    if (!el || !_sessionLive()) {
       return;
     }
-    _buffer.push(el);
+    _elements.push(el);
     _statBuffer[el.captureType] = (_statBuffer[el.captureType] ?? 0) + 1;
     dispatch('RECORD_EVENT', { captureType: el.captureType });
-    scheduleFlush();
   });
 
   api.onRecordScan?.((payload) => {
+    if (!_sessionLive()) {
+      return;
+    }
     const elements = payload?.scan?.elements ?? [];
     for (const el of elements) {
-      _buffer.push(el);
+      _elements.push(el);
     }
     _statBuffer.scans = (_statBuffer.scans ?? 0) + 1;
-    _statBuffer.elements = (_statBuffer.elements ?? 0) + elements.length;
     dispatch('RECORD_SCAN', { elementCount: elements.length });
-    scheduleFlush();
   });
 
   api.onRecordSessionClosed?.(() => {
     if (getState().recordPhase === 'idle') {
       return;
     }
-    void flushBuffer();
-    dispatch('RECORD_STOPPED');
-    Toast.info('Recording stopped', 'The controlled browser was closed.');
+    // User closed the controlled browser — finalize whatever was captured.
+    void finalizeSession('The controlled browser was closed.');
   });
 }
 
-export async function startRecording({ url }) {
+// Start a recording session for the given section's mode (interactions | hybrid).
+export async function startRecording({ url, section }) {
   const state = getState();
   if (state.recordPhase === 'recording' || state.recordPhase === 'starting') {
     return;
@@ -98,35 +76,28 @@ export async function startRecording({ url }) {
     return;
   }
 
-  dispatch('RECORD_STARTING', { url });
-  _activeMode = state.mode;
-  _activeSessionId = null;
-  _buffer = [];
+  const mode = section === SECTIONS.HYBRID ? TRACKING_MODES.HYBRID : TRACKING_MODES.INTERACTIONS;
+  dispatch('RECORD_STARTING', { section });
+  _elements = [];
   _statBuffer = {};
+  _session = { url, mode, engine: null };
 
   const profiles = await storage.getAllProfiles();
-  const browser = state.selectedBrowser
-    ? {
-        browserType: state.selectedBrowser.browserType,
-        channel: state.selectedBrowser.channel ?? null,
-        executablePath: state.selectedBrowser.executablePath ?? null,
-      }
-    : 'chromium';
 
   try {
     const res = await api.startRecordSession({
       url,
-      mode: state.mode,
+      mode,
       settings: state.settings,
       profiles,
-      browser,
+      browser: browserDescriptor(state),
     });
     if (!res?.success) {
       dispatch('RECORD_FAILED');
       Toast.error('Could not start recording', res?.error ?? undefined);
       return;
     }
-    _activeSessionId = res.sessionId;
+    _session.engine = res.engine ?? browserDescriptor(state)?.browserType ?? 'chromium';
     dispatch('RECORD_STARTED', { sessionId: res.sessionId });
     Toast.success('Recording started', 'Interact with the controlled browser window.');
   } catch (err) {
@@ -136,8 +107,7 @@ export async function startRecording({ url }) {
 }
 
 export async function stopRecording() {
-  const state = getState();
-  if (state.recordPhase !== 'recording') {
+  if (getState().recordPhase !== 'recording') {
     return;
   }
   try {
@@ -148,10 +118,40 @@ export async function stopRecording() {
   } catch (err) {
     console.error('[record-workflow] stop failed', err);
   }
-  await flushBuffer();
+  await finalizeSession();
+}
+
+// Persist the buffered session as a report (if anything was captured) and reset.
+async function finalizeSession(closedReason) {
+  if (getState().recordPhase === 'idle') {
+    return;
+  }
+  const elements = _elements;
+  const stats = _statBuffer;
+  const session = _session;
+  _elements = [];
+  _statBuffer = {};
   dispatch('RECORD_STOPPED');
-  await refreshCounts();
-  Toast.success('Recording saved');
+
+  if (elements.length === 0) {
+    Toast.info('Recording stopped', closedReason ?? 'No elements were captured.');
+    return;
+  }
+
+  try {
+    const report = await createReport({
+      mode: session.mode,
+      url: session.url,
+      engine: session.engine,
+      elements,
+      source: 'record',
+      statBreakdown: stats,
+    });
+    Toast.success(`Saved ${elements.length} captured element${elements.length === 1 ? '' : 's'}`);
+    await selectReport(report.id);
+  } catch (err) {
+    Toast.error('Failed to save recording', err?.message);
+  }
 }
 
 // Hybrid on-demand scan during a live session.

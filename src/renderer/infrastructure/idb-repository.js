@@ -1,20 +1,22 @@
 'use strict';
 
-// IndexedDB persistence for the desktop element tracker. Mirrors the data the
-// Chrome extension kept in chrome.storage.local, reorganized into object stores:
-//   - elements:  one record per captured/scanned element (indexed by mode + session)
-//   - stats:     per-mode counters (keyed by mode)
+// IndexedDB persistence, organized around REPORTS (desktop pattern). Each scan
+// or recording produces one report; its captured elements live in a separate
+// store keyed by reportId (kept out of the report metadata so the list stays
+// light). Mirrors ui-comparison-desktop's reports/elements split.
+//   - reports:   one record per capture (metadata: id, mode, url, host, counts…)
+//   - elements:  { reportId, data: [...elements] }
 //   - settings:  single settings record
 //   - profiles:  domain attribute profiles (keyed by domain)
-// Replaces background/storage-controller.js + memory-manager.js.
 
-const DB_NAME = 'element_tracker_db';
-const DB_VERSION = 1;
+const DB_NAME = 'element_tracker_reports_db';
+const DB_VERSION = 2;
 
+const STORE_REPORTS = 'reports';
 const STORE_ELEMENTS = 'elements';
-const STORE_STATS = 'stats';
 const STORE_SETTINGS = 'settings';
 const STORE_PROFILES = 'profiles';
+const STORE_AI_TESTS = 'ai_tests';
 
 const SETTINGS_KEY = 'app_settings';
 
@@ -41,23 +43,25 @@ function openDB() {
   }
   _dbPromise = new Promise((resolve, reject) => {
     const req = indexedDB.open(DB_NAME, DB_VERSION);
-    req.onupgradeneeded = (event) => {
+    req.onupgradeneeded = () => {
       const db = req.result;
-      void event;
-      if (!db.objectStoreNames.contains(STORE_ELEMENTS)) {
-        const els = db.createObjectStore(STORE_ELEMENTS, { keyPath: 'id' });
-        els.createIndex('by_mode', 'mode', { unique: false });
-        els.createIndex('by_session', 'sessionId', { unique: false });
-        els.createIndex('by_mode_ts', ['mode', 'timestamp'], { unique: false });
+      if (!db.objectStoreNames.contains(STORE_REPORTS)) {
+        const reports = db.createObjectStore(STORE_REPORTS, { keyPath: 'id' });
+        reports.createIndex('by_timestamp', 'timestamp', { unique: false });
+        reports.createIndex('by_mode', 'mode', { unique: false });
       }
-      if (!db.objectStoreNames.contains(STORE_STATS)) {
-        db.createObjectStore(STORE_STATS, { keyPath: 'mode' });
+      if (!db.objectStoreNames.contains(STORE_ELEMENTS)) {
+        db.createObjectStore(STORE_ELEMENTS, { keyPath: 'reportId' });
       }
       if (!db.objectStoreNames.contains(STORE_SETTINGS)) {
         db.createObjectStore(STORE_SETTINGS, { keyPath: 'key' });
       }
       if (!db.objectStoreNames.contains(STORE_PROFILES)) {
         db.createObjectStore(STORE_PROFILES, { keyPath: 'domain' });
+      }
+      if (!db.objectStoreNames.contains(STORE_AI_TESTS)) {
+        const ai = db.createObjectStore(STORE_AI_TESTS, { keyPath: 'id' });
+        ai.createIndex('by_timestamp', 'timestamp', { unique: false });
       }
     };
     req.onsuccess = () => resolve(req.result);
@@ -66,99 +70,76 @@ function openDB() {
   return _dbPromise;
 }
 
-// ---- elements ---------------------------------------------------------------
+// ---- reports ----------------------------------------------------------------
 
-// Append a batch of element records under a mode. Each record gets a stable id.
-async function addElements(mode, sessionId, elements) {
-  if (!Array.isArray(elements) || elements.length === 0) {
-    return 0;
-  }
+// Persist one report: lightweight metadata in `reports`, the element array in
+// `elements`. `report` must carry a unique `id`.
+async function saveReport(report, elements) {
   const db = await openDB();
-  const tx = db.transaction(STORE_ELEMENTS, 'readwrite');
-  const store = tx.objectStore(STORE_ELEMENTS);
-  let n = 0;
-  for (const el of elements) {
-    const id = `${mode}_${sessionId}_${el.elementId ?? el.id ?? `${Date.now()}_${n}`}_${n}`;
-    store.put({
-      id,
-      mode,
-      sessionId,
-      timestamp: el.timestamp ?? Date.now(),
-      captureType: el.captureType ?? 'scan',
-      element: el,
-    });
-    n++;
-  }
+  const tx = db.transaction([STORE_REPORTS, STORE_ELEMENTS], 'readwrite');
+  const meta = { ...report };
+  delete meta.elements;
+  meta.totalElements = Array.isArray(elements) ? elements.length : (report.totalElements ?? 0);
+  tx.objectStore(STORE_REPORTS).put(meta);
+  tx.objectStore(STORE_ELEMENTS).put({ reportId: report.id, data: elements ?? [] });
   await txDone(tx);
-  return n;
+  return meta;
 }
 
-async function getElementsByMode(mode) {
+// All report metadata, newest first.
+async function getReports() {
+  const db = await openDB();
+  const tx = db.transaction(STORE_REPORTS, 'readonly');
+  const recs = await requestToPromise(tx.objectStore(STORE_REPORTS).getAll());
+  return (recs ?? []).sort((a, b) => (b.timestamp ?? 0) - (a.timestamp ?? 0));
+}
+
+async function getReportElements(reportId) {
   const db = await openDB();
   const tx = db.transaction(STORE_ELEMENTS, 'readonly');
-  const index = tx.objectStore(STORE_ELEMENTS).index('by_mode');
-  const records = await requestToPromise(index.getAll(mode));
-  return (records ?? []).map((r) => r.element);
+  const rec = await requestToPromise(tx.objectStore(STORE_ELEMENTS).get(reportId));
+  return rec?.data ?? [];
 }
 
-async function countElementsByMode(mode) {
+async function deleteReport(reportId) {
   const db = await openDB();
-  const tx = db.transaction(STORE_ELEMENTS, 'readonly');
-  const index = tx.objectStore(STORE_ELEMENTS).index('by_mode');
-  return requestToPromise(index.count(mode));
-}
-
-async function clearElementsByMode(mode) {
-  const db = await openDB();
-  const tx = db.transaction(STORE_ELEMENTS, 'readwrite');
-  const index = tx.objectStore(STORE_ELEMENTS).index('by_mode');
-  const keys = await requestToPromise(index.getAllKeys(mode));
-  const store = tx.objectStore(STORE_ELEMENTS);
-  for (const key of keys ?? []) {
-    store.delete(key);
-  }
+  const tx = db.transaction([STORE_REPORTS, STORE_ELEMENTS], 'readwrite');
+  tx.objectStore(STORE_REPORTS).delete(reportId);
+  tx.objectStore(STORE_ELEMENTS).delete(reportId);
   await txDone(tx);
-  return (keys ?? []).length;
 }
 
-async function clearAllElements() {
+async function clearAllReports() {
   const db = await openDB();
-  const tx = db.transaction(STORE_ELEMENTS, 'readwrite');
+  const tx = db.transaction([STORE_REPORTS, STORE_ELEMENTS], 'readwrite');
+  tx.objectStore(STORE_REPORTS).clear();
   tx.objectStore(STORE_ELEMENTS).clear();
   await txDone(tx);
 }
 
-// ---- stats ------------------------------------------------------------------
+// ---- AI tests (generated by the AI Automation tab) --------------------------
 
-async function getStats(mode) {
+async function saveAiTest(record) {
   const db = await openDB();
-  const tx = db.transaction(STORE_STATS, 'readonly');
-  const rec = await requestToPromise(tx.objectStore(STORE_STATS).get(mode));
-  return rec ?? { mode, counts: {} };
-}
-
-async function getAllStats() {
-  const db = await openDB();
-  const tx = db.transaction(STORE_STATS, 'readonly');
-  const recs = await requestToPromise(tx.objectStore(STORE_STATS).getAll());
-  const out = {};
-  for (const r of recs ?? []) {
-    out[r.mode] = r;
-  }
-  return out;
-}
-
-async function setStats(mode, counts) {
-  const db = await openDB();
-  const tx = db.transaction(STORE_STATS, 'readwrite');
-  tx.objectStore(STORE_STATS).put({ mode, counts, lastUpdated: Date.now() });
+  const id = record.id || `ait_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const full = { ...record, id, timestamp: record.timestamp ?? Date.now() };
+  const tx = db.transaction(STORE_AI_TESTS, 'readwrite');
+  tx.objectStore(STORE_AI_TESTS).put(full);
   await txDone(tx);
+  return full;
 }
 
-async function clearStats(mode) {
+async function getAiTests() {
   const db = await openDB();
-  const tx = db.transaction(STORE_STATS, 'readwrite');
-  tx.objectStore(STORE_STATS).delete(mode);
+  const tx = db.transaction(STORE_AI_TESTS, 'readonly');
+  const recs = await requestToPromise(tx.objectStore(STORE_AI_TESTS).getAll());
+  return (recs ?? []).sort((a, b) => (b.timestamp ?? 0) - (a.timestamp ?? 0));
+}
+
+async function deleteAiTest(id) {
+  const db = await openDB();
+  const tx = db.transaction(STORE_AI_TESTS, 'readwrite');
+  tx.objectStore(STORE_AI_TESTS).delete(id);
   await txDone(tx);
 }
 
@@ -223,15 +204,14 @@ async function estimateUsage() {
 }
 
 export default {
-  addElements,
-  getElementsByMode,
-  countElementsByMode,
-  clearElementsByMode,
-  clearAllElements,
-  getStats,
-  getAllStats,
-  setStats,
-  clearStats,
+  saveReport,
+  getReports,
+  getReportElements,
+  deleteReport,
+  clearAllReports,
+  saveAiTest,
+  getAiTests,
+  deleteAiTest,
   getSettings,
   saveSettings,
   getAllProfiles,

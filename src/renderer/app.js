@@ -1,16 +1,18 @@
 'use strict';
 
-import { getState, dispatch, subscribe, TRACKING_MODES } from './state.js';
+import { getState, dispatch, subscribe, SECTIONS } from './state.js';
 import { Toast } from './components/toast.js';
 import { Modal } from './components/modal.js';
 import { createBrowserSelector } from './components/browser-selector.js';
-import { createCapturesList } from './components/captures-list.js';
+import { createReportList } from './components/report-list.js';
+import { createReportDetailsPanel } from './components/report-details-panel.js';
 import {
-  initializeData,
-  clearMode,
-  clearAllModes,
+  initializeReports,
   persistSettings,
-} from './application/data-manager.js';
+  selectReport,
+  deleteReport,
+  clearAllReports,
+} from './application/report-manager.js';
 import { runScan, cancelScan } from './application/scan-workflow.js';
 import {
   initRecordListeners,
@@ -18,7 +20,19 @@ import {
   stopRecording,
   triggerHybridScan,
 } from './application/record-workflow.js';
-import { exportMode } from './application/export-workflow.js';
+import { exportReport } from './application/export-workflow.js';
+import {
+  runAiGeneration,
+  cancelAiGeneration,
+  exportAiSpec,
+  checkClaudeCli,
+  refreshAiReportOptions,
+  setOnAiTestSaved,
+} from './application/ai-workflow.js';
+import { createAiTestList } from './components/ai-test-list.js';
+import { createAiTestDetailsPanel } from './components/ai-test-details-panel.js';
+import { selectAiTest, deleteAiTest, clearAllAiTests } from './application/ai-test-manager.js';
+import { refreshAiTests } from './application/report-manager.js';
 
 const api = window.elementTrackerAPI;
 
@@ -39,7 +53,10 @@ if (!api) {
   throw new Error('window.elementTrackerAPI is undefined');
 }
 
-api.setWindowTitle?.('Element Tracker');
+api.setWindowTitle?.('Agentic Test Automation');
+
+let _detailsPanel = null;
+let _aiDetailsPanel = null;
 
 // ---- theme ------------------------------------------------------------------
 
@@ -69,15 +86,66 @@ function syncThemeToggleButton() {
 
 function activateSection(section) {
   dispatch('SECTION_CHANGED', { section });
+  // Opening a section closes any open report details.
+  dispatch('REPORT_CLOSED');
   document.querySelectorAll('[data-main-pane-section]').forEach((btn) => {
     btn.setAttribute('aria-selected', String(btn.dataset.mainPaneSection === section));
   });
-  document.querySelectorAll('.tab-panel').forEach((panel) => {
-    panel.hidden = panel.id !== `section-${section}`;
-  });
+  syncPanes(getState());
+  if (section === 'ai') {
+    void checkClaudeCli();
+    refreshAiReportOptions(getState().reports);
+  }
 }
 
-// ---- live stats rendering ---------------------------------------------------
+// Show a details panel when a report OR an AI test is selected; otherwise show
+// the active capture section.
+function syncPanes(state) {
+  const reportOpen = !!state.selectedReportId;
+  const aiOpen = !!state.selectedAiTestId;
+  const anyDetails = reportOpen || aiOpen;
+  document.querySelectorAll('.tab-panel').forEach((panel) => {
+    panel.hidden = anyDetails || panel.id !== `section-${state.section}`;
+  });
+  const reportDetails = document.getElementById('report-details');
+  if (reportDetails) {
+    reportDetails.hidden = !reportOpen;
+  }
+  const aiDetails = document.getElementById('ai-test-details');
+  if (aiDetails) {
+    aiDetails.hidden = !aiOpen;
+  }
+}
+
+// Toggle the left-pane between the Reports list and the AI Tests list.
+function syncLeftTab(state) {
+  const tab = state.leftTab || 'reports';
+  const reportsPane = document.getElementById('reports-pane');
+  const aiPane = document.getElementById('ai-tests-pane');
+  if (reportsPane) {
+    reportsPane.hidden = tab !== 'reports';
+  }
+  if (aiPane) {
+    aiPane.hidden = tab !== 'ai';
+  }
+  document.querySelectorAll('[data-left-tab]').forEach((b) => {
+    b.setAttribute('aria-selected', String(b.dataset.leftTab === tab));
+  });
+  const title = document.getElementById('left-pane-title');
+  if (title) {
+    title.textContent = tab === 'ai' ? 'AI Tests' : 'Reports';
+  }
+  const clearReports = document.getElementById('clear-all-reports-btn');
+  const clearAi = document.getElementById('clear-all-ai-btn');
+  if (clearReports) {
+    clearReports.hidden = tab !== 'reports';
+  }
+  if (clearAi) {
+    clearAi.hidden = tab !== 'ai';
+  }
+}
+
+// ---- live stats -------------------------------------------------------------
 
 const LIVE_STAT_FIELDS = [
   { key: 'click', label: 'Clicks' },
@@ -88,30 +156,28 @@ const LIVE_STAT_FIELDS = [
 ];
 
 function renderLiveStats(state) {
-  const host = document.getElementById('live-stats');
-  if (!host) {
-    return;
-  }
   const fields = [...LIVE_STAT_FIELDS];
-  if (state.mode === TRACKING_MODES.HYBRID) {
+  if (state.recordSection === SECTIONS.HYBRID) {
     fields.push({ key: 'scan', label: 'Scans' }, { key: 'elements', label: 'Elements' });
   }
-  host.replaceChildren();
-  for (const f of fields) {
-    const card = document.createElement('div');
-    card.className = 'stat-card';
-    const v = document.createElement('div');
-    v.className = 'stat-value';
-    v.textContent = String(state.liveCounts?.[f.key] ?? 0);
-    const l = document.createElement('div');
-    l.className = 'stat-label';
-    l.textContent = f.label;
-    card.append(v, l);
-    host.appendChild(card);
-  }
+  document.querySelectorAll('[data-live-stats]').forEach((hostEl) => {
+    hostEl.replaceChildren();
+    for (const f of fields) {
+      const card = document.createElement('div');
+      card.className = 'stat-card';
+      const v = document.createElement('div');
+      v.className = 'stat-value';
+      v.textContent = String(state.liveCounts?.[f.key] ?? 0);
+      const l = document.createElement('div');
+      l.className = 'stat-label';
+      l.textContent = f.label;
+      card.append(v, l);
+      hostEl.appendChild(card);
+    }
+  });
 }
 
-// ---- storage display --------------------------------------------------------
+// ---- storage ----------------------------------------------------------------
 
 function formatBytes(bytes) {
   if (!bytes) {
@@ -119,6 +185,20 @@ function formatBytes(bytes) {
   }
   const mb = bytes / (1024 * 1024);
   return mb < 1 ? `${(bytes / 1024).toFixed(0)} KB` : `${mb.toFixed(1)} MB`;
+}
+
+// Export a stored AI test's generated spec via the save dialog.
+async function exportSavedAiTest(test) {
+  if (!test?.spec) {
+    Toast.warning('Nothing to export', 'This test has no generated spec.');
+    return;
+  }
+  const res = await api.exportFile({ content: test.spec, filename: 'generated.spec.ts', format: 'js' });
+  if (res?.success) {
+    Toast.success('Spec exported');
+  } else if (res?.reason !== 'cancelled') {
+    Toast.error('Export failed', res?.error ?? undefined);
+  }
 }
 
 // ---- boot -------------------------------------------------------------------
@@ -150,63 +230,137 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   });
 
-  // Components
-  createBrowserSelector(document.getElementById('browser-selector-slot'));
-  createBrowserSelector(document.getElementById('scan-browser-selector-slot'));
-  createCapturesList(document.getElementById('captures-list'), {
-    onExport: (mode, format) => exportMode(mode, format),
-    onClear: async (mode, label) => {
-      const ok = await Modal.confirm('Clear data', `Delete all captured ${label} data?`, {
-        confirmText: 'Clear',
+  // Browser selector in every section.
+  document.querySelectorAll('[data-browser-slot]').forEach((slot) => createBrowserSelector(slot));
+
+  // Reports list (sidebar).
+  createReportList(
+    document.getElementById('reports-list'),
+    document.getElementById('reports-empty'),
+    {
+      onSelect: (id) => void selectReport(id),
+      onExport: (report, format) => void exportReport(report, format),
+      onDelete: async (report) => {
+        const ok = await Modal.confirm('Delete report', `Delete this ${report.mode} report?`, {
+          confirmText: 'Delete',
+          destructive: true,
+        });
+        if (ok) {
+          await deleteReport(report.id);
+          Toast.success('Report deleted');
+        }
+      },
+    }
+  );
+
+  // Report details (main pane).
+  _detailsPanel = createReportDetailsPanel(document.getElementById('report-details'), {
+    onClose: () => dispatch('REPORT_CLOSED'),
+    onExport: (report, format) => void exportReport(report, format),
+  });
+
+  document.getElementById('clear-all-reports-btn')?.addEventListener('click', async () => {
+    if ((getState().reports ?? []).length === 0) {
+      return;
+    }
+    const ok = await Modal.confirm('Clear all reports', 'Delete every stored report?', {
+      confirmText: 'Clear all',
+      destructive: true,
+    });
+    if (ok) {
+      await clearAllReports();
+      Toast.success('All reports cleared');
+    }
+  });
+
+  // ---- AI Tests list + details ----
+  createAiTestList(document.getElementById('ai-tests-list'), document.getElementById('ai-tests-empty'), {
+    onSelect: (id) => selectAiTest(id),
+    onDelete: async (t) => {
+      const ok = await Modal.confirm('Delete AI test', 'Delete this generated test?', {
+        confirmText: 'Delete',
         destructive: true,
       });
       if (ok) {
-        await clearMode(mode);
-        Toast.success(`Cleared ${label} data`);
+        await deleteAiTest(t.id);
+        Toast.success('AI test deleted');
       }
     },
-    onClearAll: async () => {
-      const ok = await Modal.confirm('Clear all data', 'Delete all captured data across every mode?', {
-        confirmText: 'Clear all',
-        destructive: true,
-      });
-      if (ok) {
-        await clearAllModes();
-        Toast.success('Cleared all data');
-      }
-    },
+  });
+
+  _aiDetailsPanel = createAiTestDetailsPanel(document.getElementById('ai-test-details'), {
+    onClose: () => dispatch('AI_TEST_CLOSED'),
+    onExport: (test) => void exportSavedAiTest(test),
+  });
+
+  // Left-pane tab switcher.
+  document.querySelectorAll('[data-left-tab]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      dispatch('LEFT_TAB_CHANGED', { tab: btn.dataset.leftTab });
+      syncLeftTab(getState());
+    });
+  });
+
+  document.getElementById('clear-all-ai-btn')?.addEventListener('click', async () => {
+    if ((getState().aiTests ?? []).length === 0) {
+      return;
+    }
+    const ok = await Modal.confirm('Clear all AI tests', 'Delete every generated test?', {
+      confirmText: 'Clear all',
+      destructive: true,
+    });
+    if (ok) {
+      await clearAllAiTests();
+      Toast.success('All AI tests cleared');
+    }
+  });
+
+  // Refresh the AI-tests list when a run finishes; switch the left pane to it.
+  setOnAiTestSaved(() => {
+    void refreshAiTests().then(() => {
+      dispatch('LEFT_TAB_CHANGED', { tab: 'ai' });
+      syncLeftTab(getState());
+    });
   });
 
   initRecordListeners();
 
-  // ---- record controls ----
-  document.querySelectorAll('input[name="record-mode"]').forEach((r) => {
-    r.addEventListener('change', (e) => {
-      if (e.target.checked) {
-        dispatch('MODE_CHANGED', { mode: e.target.value });
-        void persistSettings();
-      }
-    });
-  });
-
-  document.querySelectorAll('#capture-toggles input[data-setting]').forEach((cb) => {
+  // ---- capture-type toggles (shared settings across sections) ----
+  document.querySelectorAll('[data-capture-toggles] input[data-setting]').forEach((cb) => {
     cb.addEventListener('change', (e) => {
       dispatch('SETTING_TOGGLED', { key: e.target.dataset.setting, value: e.target.checked });
       void persistSettings();
+      // keep the other section's mirror toggles in sync
+      document
+        .querySelectorAll(`[data-capture-toggles] input[data-setting="${e.target.dataset.setting}"]`)
+        .forEach((other) => {
+          other.checked = e.target.checked;
+        });
     });
   });
 
-  document.getElementById('record-start-btn')?.addEventListener('click', () => {
-    const url = document.getElementById('record-url')?.value?.trim();
-    void startRecording({ url });
+  // ---- record start/stop (Interactions + Hybrid) ----
+  document.querySelectorAll('[data-record-start]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const section = btn.dataset.recordStart;
+      const urlId = section === 'hybrid' ? 'hybrid-url' : 'interactions-url';
+      const url = document.getElementById(urlId)?.value?.trim();
+      void startRecording({ url, section });
+    });
   });
-  document.getElementById('record-stop-btn')?.addEventListener('click', () => void stopRecording());
-  document.getElementById('hybrid-scan-btn')?.addEventListener('click', () => {
-    void triggerHybridScan({ filters: [] });
+  document.querySelectorAll('[data-record-stop]').forEach((btn) => {
+    btn.addEventListener('click', () => void stopRecording());
+  });
+  document.getElementById('hybrid-scan-now-btn')?.addEventListener('click', () => {
+    const filters = (document.getElementById('hybrid-filters')?.value ?? '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    void triggerHybridScan({ filters });
     Toast.info('Scanning current page…');
   });
 
-  // ---- scan controls ----
+  // ---- scan ----
   document.getElementById('scan-btn')?.addEventListener('click', () => {
     const url = document.getElementById('scan-url')?.value?.trim();
     const filters = (document.getElementById('scan-filters')?.value ?? '')
@@ -217,10 +371,17 @@ document.addEventListener('DOMContentLoaded', async () => {
   });
   document.getElementById('scan-cancel-btn')?.addEventListener('click', () => void cancelScan());
 
-  document.getElementById('record-url')?.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') {
-      document.getElementById('record-start-btn')?.click();
-    }
+  // ---- AI automation ----
+  document.getElementById('ai-run-btn')?.addEventListener('click', () => void runAiGeneration());
+  document.getElementById('ai-cancel-btn')?.addEventListener('click', () => void cancelAiGeneration());
+  document.getElementById('ai-export-btn')?.addEventListener('click', () => void exportAiSpec());
+
+  ['interactions-url', 'hybrid-url'].forEach((id) => {
+    document.getElementById(id)?.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.target.closest('.panel')?.querySelector('[data-record-start]')?.click();
+      }
+    });
   });
   document.getElementById('scan-url')?.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') {
@@ -228,32 +389,43 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   });
 
-  // ---- reactive UI updates ----
+  // ---- reactive UI ----
+  let _lastSelected = null;
+  let _lastElements = null;
+  let _lastReportsRef = null;
+  let _lastAiSelected = null;
   subscribe((state) => {
-    // Record buttons / live panel
+    syncPanes(state);
+
+    // Keep the AI grounding-report dropdown in sync with reports.
+    if (state.reports !== _lastReportsRef) {
+      _lastReportsRef = state.reports;
+      refreshAiReportOptions(state.reports);
+    }
+
+    // Record buttons + live panel (per section).
     const recording = state.recordPhase === 'recording';
     const starting = state.recordPhase === 'starting';
-    const startBtn = document.getElementById('record-start-btn');
-    const stopBtn = document.getElementById('record-stop-btn');
-    const hybridBtn = document.getElementById('hybrid-scan-btn');
-    const liveCard = document.getElementById('record-live');
-    if (startBtn) {
-      startBtn.hidden = recording;
-      startBtn.disabled = starting;
-      startBtn.querySelector('.btn-label').textContent = starting ? 'Starting…' : 'Start Recording';
+    document.querySelectorAll('[data-record-start]').forEach((b) => {
+      b.hidden = recording;
+      b.disabled = starting;
+      b.querySelector('.btn-label').textContent = starting ? 'Starting…' : 'Start Recording';
+    });
+    document.querySelectorAll('[data-record-stop]').forEach((b) => {
+      b.hidden = !recording;
+    });
+    const scanNow = document.getElementById('hybrid-scan-now-btn');
+    if (scanNow) {
+      scanNow.hidden = !(recording && state.recordSection === SECTIONS.HYBRID);
     }
-    if (stopBtn) {
-      stopBtn.hidden = !recording;
-    }
-    if (hybridBtn) {
-      hybridBtn.hidden = !(recording && state.mode === TRACKING_MODES.HYBRID);
-    }
-    if (liveCard) {
-      liveCard.hidden = !recording;
-    }
+    document.querySelectorAll('[data-record-live]').forEach((card) => {
+      // only show the live card inside the section that owns the session
+      const sectionId = card.closest('.tab-panel')?.id?.replace('section-', '');
+      card.hidden = !(recording && state.recordSection === sectionId);
+    });
     renderLiveStats(state);
 
-    // Scan progress / buttons
+    // Scan progress.
     const scanning = state.scanPhase === 'scanning';
     const scanBtn = document.getElementById('scan-btn');
     const scanCancel = document.getElementById('scan-cancel-btn');
@@ -268,7 +440,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       scanCancel.hidden = !scanning;
     }
     if (progress) {
-      progress.hidden = !scanning && state.scanPhase !== 'done';
+      progress.hidden = !scanning;
       progress.setAttribute('aria-valuenow', String(state.scanProgress.pct ?? 0));
     }
     if (bar) {
@@ -282,7 +454,34 @@ document.addEventListener('DOMContentLoaded', async () => {
       scanErr.textContent = state.scanPhase === 'error' ? state.scanError ?? 'Scan failed' : '';
     }
 
-    // Storage display
+    // Report details render (only when selection or its elements changed).
+    if (state.selectedReportId !== _lastSelected || state.selectedReportElements !== _lastElements) {
+      _lastSelected = state.selectedReportId;
+      _lastElements = state.selectedReportElements;
+      if (state.selectedReportId) {
+        const report = state.reports.find((r) => r.id === state.selectedReportId);
+        if (report && state.selectedReportElements != null) {
+          _detailsPanel.render(report, state.selectedReportElements);
+        } else if (report) {
+          _detailsPanel.renderEmpty('Loading…');
+        }
+      } else {
+        _detailsPanel.clear();
+      }
+    }
+
+    // AI-test details render (only when the selection changed).
+    if (state.selectedAiTestId !== _lastAiSelected) {
+      _lastAiSelected = state.selectedAiTestId;
+      if (state.selectedAiTestId) {
+        const test = (state.aiTests ?? []).find((t) => t.id === state.selectedAiTestId);
+        _aiDetailsPanel?.render(test);
+      } else {
+        _aiDetailsPanel?.clear();
+      }
+    }
+
+    // Storage.
     const sv = document.getElementById('storage-value');
     if (sv) {
       sv.textContent = formatBytes(state.usage?.usage ?? 0);
@@ -304,7 +503,6 @@ document.addEventListener('DOMContentLoaded', async () => {
       .catch((err) => dispatch('BROWSER_DETECTION_FAILED', { error: err?.message ?? String(err) }));
   }
 
-  // ---- version in status bar ----
   api.getVersion?.().then((v) => {
     const hint = document.querySelector('.status-right__hint');
     if (hint && v) {
@@ -312,17 +510,21 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   });
 
-  // ---- load persisted data ----
-  await initializeData();
+  // ---- load persisted reports + settings ----
+  // Degrade gracefully if IndexedDB is unavailable (e.g. a locked-down profile):
+  // the app stays usable, just without persisted history this session.
+  try {
+    await initializeReports();
+  } catch (err) {
+    console.error('[app] storage init failed — continuing without persistence', err);
+    Toast.warning('Storage unavailable', 'Captures and AI tests won’t be saved this session.');
+  }
 
-  // Reflect loaded settings into the controls.
   const st = getState();
-  document.querySelectorAll('input[name="record-mode"]').forEach((r) => {
-    r.checked = r.value === st.mode;
-  });
-  document.querySelectorAll('#capture-toggles input[data-setting]').forEach((cb) => {
+  document.querySelectorAll('[data-capture-toggles] input[data-setting]').forEach((cb) => {
     cb.checked = st.settings[cb.dataset.setting] !== false;
   });
 
-  activateSection('record');
+  activateSection(SECTIONS.INTERACTIONS);
+  syncLeftTab(getState());
 });

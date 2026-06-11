@@ -275,7 +275,8 @@ class AttributeProfiler{
         }
 
         if (sampled.length < targetSize) {
-            const remaining = elements.filter(el => !sampled.includes(el));
+            const sampledSet = new Set(sampled);
+            const remaining = elements.filter(el => !sampledSet.has(el));
             const additionalSample = this.randomSample(remaining, targetSize - sampled.length);
             sampled.push(...additionalSample);
         }

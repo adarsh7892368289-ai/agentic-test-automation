@@ -9,6 +9,7 @@ const log = require('electron-log');
 const CH = require('./ipc-channels');
 const playwrightManager = require('./playwright-manager');
 const recordManager = require('./record-manager');
+const aiManager = require('./ai-manager');
 const { isSafeBasename } = require('@security/guards.js');
 
 let _mainWindow = null;
@@ -37,6 +38,8 @@ function _pushToWindow(channel, payload) {
   }
 }
 
+const _aiAborts = new Map(); // operationId -> AbortController
+
 function registerIpcHandlers(mainWindow) {
   _mainWindow = mainWindow;
   _registerMetaHandlers();
@@ -44,6 +47,54 @@ function registerIpcHandlers(mainWindow) {
   _registerScanHandlers();
   _registerRecordHandlers();
   _registerFileHandlers();
+  _registerAiHandlers();
+}
+
+function _registerAiHandlers() {
+  ipcMain.handle(CH.AI_CHECK_CLI, () => {
+    try {
+      return aiManager.detectClaudeCli();
+    } catch (err) {
+      return { ok: false, error: err?.message };
+    }
+  });
+
+  ipcMain.handle(CH.AI_RUN, async (event, params = {}) => {
+    const { operationId, startUrl, stepsText, browserType, reportElements, reportMeta } = params;
+    const controller = new AbortController();
+    if (operationId) {
+      _aiAborts.set(operationId, controller);
+    }
+    const onEvent = (ev) => _pushToWindow(CH.AI_PROGRESS, { operationId, event: ev });
+
+    try {
+      const result = await aiManager.runGeneration({
+        startUrl,
+        stepsText,
+        browserType,
+        reportElements: reportElements ?? null,
+        reportMeta: reportMeta ?? null,
+        onEvent,
+        signal: controller.signal,
+      });
+      return { success: result.success, result };
+    } catch (err) {
+      log.error('AI_RUN failed', { error: err?.message, code: err?.code });
+      return { success: false, error: err?.message, code: err?.code ?? null };
+    } finally {
+      if (operationId) {
+        _aiAborts.delete(operationId);
+      }
+    }
+  });
+
+  ipcMain.handle(CH.AI_CANCEL, (event, { operationId } = {}) => {
+    const c = _aiAborts.get(operationId);
+    if (c) {
+      c.abort();
+    }
+    return { acknowledged: true };
+  });
 }
 
 function _registerMetaHandlers() {
@@ -159,13 +210,16 @@ function _registerFileHandlers() {
   // Save serialized export content to a user-chosen file. The renderer produces
   // the JSON/CSV string; main owns the dialog + disk write.
   ipcMain.handle(CH.EXPORT_FILE, async (event, { content, filename, format } = {}) => {
-    const ext = format === 'csv' ? 'csv' : 'json';
+    const extByFormat = { csv: 'csv', json: 'json', js: 'js' };
+    const ext = extByFormat[format] ?? 'json';
     const safeName = isSafeBasename(filename) ? filename : `export.${ext}`;
+    // Use the file's real terminal extension for the dialog filter (e.g. .spec.js).
+    const dialogExt = safeName.includes('.') ? safeName.split('.').pop() : ext;
 
     const { canceled, filePath } = await dialog.showSaveDialog(_mainWindow, {
       title: `Export as ${ext.toUpperCase()}`,
       defaultPath: path.join(app.getPath('downloads'), safeName),
-      filters: [{ name: ext.toUpperCase(), extensions: [ext] }],
+      filters: [{ name: ext.toUpperCase(), extensions: [dialogExt] }],
     });
 
     if (canceled || !filePath) {
